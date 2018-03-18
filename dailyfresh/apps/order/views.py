@@ -23,7 +23,7 @@ class OrderPlaceView(View):
 
         #获取用户收货地址的信息
         addrs = Address.objects.filter(user=user)
-        print(addrs)
+        #print(addrs)
         #获取redis链接
         conn = get_redis_connection('default')
 
