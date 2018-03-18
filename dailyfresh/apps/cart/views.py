@@ -115,7 +115,7 @@ class CartInfoView(LoginRequiredMixin, View):
             total_count += int(count)
             total_amount += amount
 
-        print(sku.id)
+        # print(sku.id)
 
         # 组织模板上下文
         context = {
@@ -157,6 +157,7 @@ class CartUpdateView(View):
             return JsonResponse({'res': 3, 'errmsg': '该商品不存在'})
 
         if count > sku.stock:
+
             return JsonResponse({'res': 4, 'errmsg': '库存不足'})
 
         conn = get_redis_connection('default')

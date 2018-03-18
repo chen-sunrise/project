@@ -5,6 +5,8 @@ from goods.models import GoodsSKU
 from user.models import Address
 from order.models import OrderInfo, OrderGoods
 from django_redis import get_redis_connection
+
+from django.db import transaction  #事物
 # Create your views here.
 
 # 提交订单页面视图
@@ -23,7 +25,7 @@ class OrderPlaceView(View):
 
         #获取用户收货地址的信息
         addrs = Address.objects.filter(user=user)
-        #print(addrs)
+        # print(addrs)
         #获取redis链接
         conn = get_redis_connection('default')
 
@@ -89,8 +91,10 @@ class OrderPlaceView(View):
 
 
 # 订单事物
-class OrderCommitView(View):
+# /order/commit
+class OrderCommitView1(View):
     '''订单创建'''
+
     def post(self, request):
         user = request.user
         if not user.is_authenticated():
@@ -102,15 +106,15 @@ class OrderCommitView(View):
         # print(addr_id+'---'+pay_method+'---'+sku_ids)
         if not all([addr_id, pay_method, sku_ids]):
             return JsonResponse({'res': 1, 'errmsg': '参数不完整'})
-        print(1)
+
         try:
             addr = Address.objects.get(id=addr_id)
         except Address.DoesNotExist:
             return JsonResponse({'res': 2, 'errmsg': '地址信息错误'})
-        print(2)
+
         if pay_method not in OrderInfo.PAY_METHODS.keys():
             return JsonResponse({'res': 3, 'errmsg': '非法的支付方式'})
-        print(3)
+
         # 组织订单信息
         # 组织订单id: 20180316115930+用户id
         from datetime import datetime
@@ -119,7 +123,7 @@ class OrderCommitView(View):
         transit_price = 10
         total_count = 0
         total_price = 0
-        print(3.1)
+
         # todo: 向df_order_info中添加一条记录
         order = OrderInfo.objects.create(
             order_id = order_id,
@@ -130,7 +134,9 @@ class OrderCommitView(View):
             total_price = total_price,
             transit_price = transit_price,
         )
-        print(4)
+
+
+
         # todo: 订单中包含几个商品需要向df_order_goods中添加几条记录
         conn = get_redis_connection('default')
         cart_key = 'cart_%d' % user.id
@@ -148,20 +154,20 @@ class OrderCommitView(View):
                 count = count,
                 price = sku.price,
             )
-            print(5)
+
             sku.stock -= int(count)
             sku.sales += int(count)
             sku.save()
-            print(6)
+
             # 累加计算订单中商品的总数目和总价格
             total_count += int(count)
             total_price += sku.price * int(count)
-        print(7)
+
         # todo: 更新订单信息中商品的总数目和总价格
         order.total_count += total_count
         order.total_price += total_price
         order.save()
-        print(8)
+
         # todo: 删除购物车中对应的记录
         # hdel(key, *args)
         conn.hdel(cart_key, *sku_ids)
@@ -169,9 +175,224 @@ class OrderCommitView(View):
         return JsonResponse({'res': 5, 'errmsg': '订单创建成功'})
 
 
+'''
+    1）并发问题：
+      当多个用户同时购买同一件商品的时候，可能就会出现订单并发的问题。
+    例:
+      商品的库存还有10件，2人同时下订单，每人买5件，2人下单都成功后商品库存还有5件。
+
+    2）解决方式
+      2.1 悲观锁：在事务中查询数据的时候尝试对数据进行加锁(互斥锁), 获取到锁的事务可以进行操作，获
+      取不到锁事务的需要等待锁释放。（主要用在秒杀类活动时间）
+      2.2 乐观锁：在查询数据的时候不加锁，在进行数据修改的时候需要做判断，更新失败需要重新进行尝试。（主要可以解决平时的用途）
+'''
+# 订单中的事物
+
+# 悲观锁的解决方式
+class OrderCommitView2(View):
+    '''订单创建'''
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        if not user.is_authenticated():
+            return JsonResponse({'res': 0, 'errmsg': '用户未登录'})
+
+        addr_id = request.POST.get('addr_id')
+        pay_method = request.POST.get('pay_method')
+        sku_ids = request.POST.get('sku_ids')
+        # print(addr_id+'---'+pay_method+'---'+sku_ids)
+        if not all([addr_id, pay_method, sku_ids]):
+            return JsonResponse({'res': 1, 'errmsg': '参数不完整'})
+
+        try:
+            addr = Address.objects.get(id=addr_id)
+        except Address.DoesNotExist:
+            return JsonResponse({'res': 2, 'errmsg': '地址信息错误'})
+
+        if pay_method not in OrderInfo.PAY_METHODS.keys():
+            return JsonResponse({'res': 3, 'errmsg': '非法的支付方式'})
+
+        # 组织订单信息
+        # 组织订单id: 20180316115930+用户id
+        from datetime import datetime
+        order_id = datetime.now().strftime("%Y%m%d%H%M%S") + str(user.id)
+        # 设置事物保存点
+        sid = transaction.savepoint()
+
+        try:
+            transit_price = 10
+            total_count = 0
+            total_price = 0
+
+            # todo: 向df_order_info中添加一条记录
+            order = OrderInfo.objects.create(
+                order_id=order_id,
+                user=user,
+                addr=addr,
+                pay_method=pay_method,
+                total_count=total_count,
+                total_price=total_price,
+                transit_price=transit_price,
+            )
+
+
+            # todo: 订单中包含几个商品需要向df_order_goods中添加几条记录
+            conn = get_redis_connection('default')
+            cart_key = 'cart_%d' % user.id
+            sku_ids = sku_ids.split(',')
+            for sku_id in sku_ids:
+
+                # 悲观锁解决实现代码，select_for_update()方法是拿到互斥锁
+                try:
+                    # select * from df_goods_sku where id=<sku_id> for update
+                    sku = GoodsSKU.objects.select_for_update().get(id=sku_id)
+                except GoodsSKU.DoesNotExist:
+                    transaction.savepoint_rollback(sid)
+
+
+                count = conn.hget(cart_key, sku_id)
+
+                OrderGoods.objects.create(
+                    order=order,
+                    sku=sku,
+                    count=count,
+                    price=sku.price,
+                )
+
+                sku.stock -= int(count)
+                sku.sales += int(count)
+                sku.save()
+
+                # 累加计算订单中商品的总数目和总价格
+                total_count += int(count)
+                total_price += sku.price * int(count)
+
+            # todo: 更新订单信息中商品的总数目和总价格
+            order.total_count += total_count
+            order.total_price += total_price
+            order.save()
+
+        except Exception as e:
+            #发生错误，回滚到sid保存点
+            transaction.savepoint_rollback(sid)
+
+        # todo: 删除购物车中对应的记录
+        # hdel(key, *args)
+        conn.hdel(cart_key, *sku_ids)
+
+        return JsonResponse({'res': 5, 'errmsg': '订单创建成功'})
+
+# 乐观锁的解决方式
+class OrderCommitView(View):
+    '''订单创建'''
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        if not user.is_authenticated():
+            return JsonResponse({'res': 0, 'errmsg': '用户未登录'})
+
+        addr_id = request.POST.get('addr_id')
+        pay_method = request.POST.get('pay_method')
+        sku_ids = request.POST.get('sku_ids')
+        # print(addr_id+'---'+pay_method+'---'+sku_ids)
+        if not all([addr_id, pay_method, sku_ids]):
+            return JsonResponse({'res': 1, 'errmsg': '参数不完整'})
+
+        try:
+            addr = Address.objects.get(id=addr_id)
+        except Address.DoesNotExist:
+            return JsonResponse({'res': 2, 'errmsg': '地址信息错误'})
+
+        if pay_method not in OrderInfo.PAY_METHODS.keys():
+            return JsonResponse({'res': 3, 'errmsg': '非法的支付方式'})
+
+        # 组织订单信息
+        # 组织订单id: 20180316115930+用户id
+        from datetime import datetime
+        order_id = datetime.now().strftime("%Y%m%d%H%M%S") + str(user.id)
+
+        transit_price = 10
+        total_count = 0
+        total_price = 0
+        # 设置事物保存点
+        sid = transaction.savepoint()
+        try:
+            # todo: 向df_order_info中添加一条记录
+            order = OrderInfo.objects.create(
+                order_id=order_id,
+                user=user,
+                addr=addr,
+                pay_method=pay_method,
+                total_count=total_count,
+                total_price=total_price,
+                transit_price=transit_price,
+            )
 
 
 
+            # todo: 订单中包含几个商品需要向df_order_goods中添加几条记录
+            conn = get_redis_connection('default')
+            cart_key = 'cart_%d' % user.id
+            sku_ids = sku_ids.split(',')
+            for sku_id in sku_ids:
+                for i in range(3):
+                    try:
+                        sku = GoodsSKU.objects.get(id=sku_id)
+                    except GoodsSKU.DoesNotExist:
+                        transaction.savepoint_rollback(sid)
+                        return JsonResponse({'res': 4, 'errmsg': '商品信息错误'})
 
+                    count = conn.hget(cart_key, sku_id)
 
+                    if int(count) < sku.stock:
+                        transaction.savepoint_rollback(sid)
+                        return JsonResponse({'res': 6, 'errmsg': '库存不足'})
+                    # todo:减少商品库存，增加销量
+                    orgin_stock = sku.stock
+                    new_stock = orgin_stock - int(count)
+                    new_sales = sku.sales + int(count)
 
+                    # 更新商品库存和销量
+                    # update df_goods_sku set stock=new_stock, sales=new_sales
+                    # where id=sku_id and stock=origin_stock;
+                    # update返回数字，代表更新的行数
+                    res = GoodsSKU.objects.filter(id=sku_id, stock=orgin_stock).update(stock=new_stock, sales=new_sales)
+                    if res == 0:
+                        if i == 2:
+                            #尝试了三次，还没成功，表示失败
+                            transaction.savepoint_rollback(sid)
+                            return JsonResponse({'res': 7, 'errmsg': '下单失败'})
+                        continue
+                    OrderGoods.objects.create(
+                        order=order,
+                        sku=sku,
+                        count=count,
+                        price=sku.price,
+                    )
+
+                    sku.stock -= int(count)
+                    sku.sales += int(count)
+                    sku.save()
+
+                    # 累加计算订单中商品的总数目和总价格
+                    total_count += int(count)
+                    total_price += sku.price * int(count)
+
+                    break
+
+            # todo: 更新订单信息中商品的总数目和总价格
+            order.total_count += total_count
+            order.total_price += total_price
+            order.save()
+
+        except Exception as e:
+            #发生错误，回滚到sid保存点
+            transaction.savepoint_rollback(sid)
+
+        # todo: 删除购物车中对应的记录
+        # hdel(key, *args)
+        conn.hdel(cart_key, *sku_ids)
+
+        return JsonResponse({'res': 5, 'errmsg': '订单创建成功'})

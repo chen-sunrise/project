@@ -23,8 +23,8 @@
             <li class="col05">{{ sku.price }}元</li>
             <li class="col06">
                 <div class="num_add">
-                    <a href="javascript:;" class="add fl">+</a>
-                    <input type="text" sku_id="{{ sku.id }}" class="num_show fl" value="{{ sku.count }}">
+                    <a href="javascript:;" class="add fl"  >+</a>
+                    <input type="text" sku_id="{{ sku.id }}" sku_stock="{{ sku.stock }}" class="num_show fl" value="{{ sku.count }}">
                     <a href="javascript:;" class="minus fl">-</a>
                 </div>
             </li>
@@ -144,12 +144,15 @@
     $('.add').click(function () {
         var count = $(this).next().val();
         var sku_id = $(this).next().attr('sku_id');
-
+        var sku_stock = $(this).next().attr('sku_stock');
         count = parseInt(count)+1;
         update_remote_cart_info(sku_id, count)
 
         if(update_error == false){
             //更新成功
+            if(count >= sku_stock) {
+                count = sku_stock
+            }
             $(this).next().val(count);
             var sku_ul = $(this).parents('ul');
             update_sku_amount(sku_ul);
@@ -241,7 +244,7 @@
     $('.col08').children('a').click(function () {
 
         var sku_id = $(this).attr('sku_id');
-        alert(sku_id)
+        //alert(sku_id)
         var csrf = $('input[name="csrfmiddlewaretoken"]').val();
 
         params = {
